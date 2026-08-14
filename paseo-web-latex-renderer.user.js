@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Paseo Web LaTeX Renderer
 // @namespace    local.paseo.latex
-// @version      2.2.1
-// @description  Render LaTeX in Paseo Web and copy formulas as source LaTeX.
+// @version      2.3.4
+// @description  Render LaTeX in Paseo and copy formulas as source LaTeX.
 // @match        https://app.paseo.sh/*
 // @match        https://*.paseo.sh/*
 // @match        https://paseo.sh/*
@@ -29,6 +29,7 @@
     rendered: 0,
     crossNodeRendered: 0,
     sourceBlockRendered: 0,
+    deferredTargets: 0,
     errors: 0,
     lastError: ""
   };
@@ -48,12 +49,40 @@
     "[data-paseo-latex]"
   ].join(",");
 
+  // The React-source recovery path is intentionally more conservative than
+  // ordinary text scanning. It must never replace a code sample or editor.
+  const SOURCE_BLOCK_SKIP_SELECTOR = [
+    "pre",
+    "code",
+    "textarea",
+    "input",
+    "button",
+    "[contenteditable='true']",
+    "[contenteditable='plaintext-only']",
+    "script",
+    "style",
+    "noscript"
+  ].join(",");
+
   const BLOCK_TAGS = new Set([
     "P", "LI", "DIV", "TD", "TH", "BLOCKQUOTE", "FIGCAPTION"
   ]);
-  const BLOCK_SELECTOR = "p, li, div, td, th, blockquote, figcaption";
   const ASSISTANT_MESSAGE_SELECTOR = "[data-testid='assistant-message']";
+  // React Fiber recovery is an edge-case compatibility path. It is expensive
+  // on long conversations, so normal DOM-based math rendering is the default.
+  const ENABLE_REACT_SOURCE_RECOVERY = false;
+  const EAGER_RENDER_CANDIDATE_LIMIT = 250;
+  const DEFERRED_RENDER_BATCH_SIZE = 100;
+  const MAX_CROSS_NODE_BLOCK_ANCESTORS = 8;
+  const LAZY_RENDER_ROOT_MARGIN = "1200px 0px";
   const sourceHiddenDisplays = new WeakMap();
+  const rawLatexSourceElements = new WeakSet();
+  const ownedNodes = new WeakSet();
+  const lazyObservedTargets = new WeakSet();
+  const readyLazyTargets = new WeakSet();
+  const transientOwnedNodes = new Set();
+  let transientOwnershipTimer = null;
+  let lazyObserver = null;
 
   function addStyle(css) {
     try {
@@ -126,6 +155,7 @@
       `Rendered formulas: ${state.rendered}`,
       `Cross-node formulas: ${state.crossNodeRendered}`,
       `Source-block formulas: ${state.sourceBlockRendered}`,
+      `Deferred formula regions: ${state.deferredTargets}`,
       `Render errors: ${state.errors}`
     ];
 
@@ -148,6 +178,19 @@
     return -1;
   }
 
+  function isStandaloneDoubleDollar(text, start, end) {
+    const lineStart = text.lastIndexOf("\n", start - 1) + 1;
+    const nextLineBreak = text.indexOf("\n", end);
+    const lineEnd = nextLineBreak === -1 ? text.length : nextLineBreak;
+
+    return !text.slice(lineStart, start).trim() &&
+      !text.slice(end, lineEnd).trim();
+  }
+
+  function hasEquationTag(latex) {
+    return /\\tag\*?\s*\{/.test(latex);
+  }
+
   function looksLikeInlineMath(latex) {
     const value = latex.trim();
     if (!value) return false;
@@ -160,7 +203,7 @@
   function normalizeLatex(latex) {
     // Generated Paseo content commonly writes 1.56% instead of 1.56\\%.
     return latex
-      .replace(/(\d(?:\.\d+)?)%(?=\s|$)/g, "$1\\%")
+      .replace(/(\d+(?:\.\d+)?)%(?![A-Za-z])/g, "$1\\%")
       // \ &\ is a common textual spelling of a bitwise AND. A bare & is
       // invalid outside an alignment environment, so make it a math operator.
       .replace(/\\\s*&\\\s*/g, " \\mathbin{\\&} ");
@@ -189,8 +232,15 @@
 
       if (text.startsWith("$$", i)) {
         const close = findClosing(text, "$$", i + 2);
-        if (close !== -1 && text.slice(i + 2, close).trim()) {
-          add(close + 2, i + 2, close, true);
+        const latex = close === -1 ? "" : text.slice(i + 2, close);
+        if (close !== -1 && latex.trim()) {
+          add(
+            close + 2,
+            i + 2,
+            close,
+            hasEquationTag(latex) ||
+              isStandaloneDoubleDollar(text, i, close + 2)
+          );
           continue;
         }
       }
@@ -207,7 +257,7 @@
         const close = findClosing(text, "\\)", i + 2);
         const latex = close === -1 ? "" : text.slice(i + 2, close);
         if (close !== -1 && looksLikeInlineMath(latex)) {
-          add(close + 2, i + 2, close, false);
+          add(close + 2, i + 2, close, hasEquationTag(latex));
           continue;
         }
       }
@@ -216,7 +266,7 @@
         const close = findClosing(text, "$", i + 1);
         const latex = close === -1 ? "" : text.slice(i + 1, close);
         if (close !== -1 && looksLikeInlineMath(latex)) {
-          add(close + 1, i + 1, close, false);
+          add(close + 1, i + 1, close, hasEquationTag(latex));
           continue;
         }
       }
@@ -270,9 +320,59 @@
     return null;
   }
 
+  function isRawLatexSourceElement(element) {
+    if (!element || element.nodeType !== 1) return false;
+
+    if (rawLatexSourceElements.has(element)) return true;
+
+    // Do not read element.textContent here. On a long conversation that
+    // creates a complete string copy of every ancestor subtree per text node.
+    let first = element.firstChild;
+    while (first && first.nodeType !== 3) first = first.firstChild;
+    const source = (first?.nodeValue || "").trimStart();
+    const isSource = /^\{\s*\\(?:color|textcolor)\s*\{[^}\r\n]+\}/.test(source);
+    if (isSource) rawLatexSourceElements.add(element);
+    return isSource;
+  }
+
+  function isRawLatexSourceContext(element) {
+    for (let current = element; current && current.nodeType === 1; current = current.parentElement) {
+      if (isRawLatexSourceElement(current)) return true;
+    }
+    return false;
+  }
+
   function shouldIgnore(textNode) {
     const parent = textNode.parentElement;
-    return !parent || Boolean(parent.closest(IGNORE_SELECTOR));
+    return !parent ||
+      Boolean(parent.closest(IGNORE_SELECTOR)) ||
+      isRawLatexSourceContext(parent);
+  }
+
+  function markOwned(node) {
+    ownedNodes.add(node);
+    return node;
+  }
+
+  function markTransientlyOwned(node) {
+    transientOwnedNodes.add(node);
+
+    if (transientOwnershipTimer === null) {
+      transientOwnershipTimer = setTimeout(() => {
+        transientOwnershipTimer = null;
+        transientOwnedNodes.clear();
+      }, 0);
+    }
+
+    return node;
+  }
+
+  function isOwnedNode(node) {
+    if (!node || ownedNodes.has(node) || transientOwnedNodes.has(node)) {
+      return Boolean(node);
+    }
+    const element = node.nodeType === 1 ? node : node.parentElement;
+    return Boolean(element?.closest?.("[data-paseo-latex]"));
   }
 
   function createFormula(
@@ -281,7 +381,7 @@
     fromCrossNodeScan,
     fromSourceBlockScan = false
   ) {
-    const host = doc.createElement("span");
+    const host = markOwned(doc.createElement("span"));
     host.className = match.display
       ? "paseo-latex paseo-latex--display"
       : "paseo-latex";
@@ -361,7 +461,19 @@
     block.removeAttribute("data-paseo-latex-source-block");
   }
 
+  function shouldSkipSourceBlock(block) {
+    return !block || Boolean(
+      block.closest(SOURCE_BLOCK_SKIP_SELECTOR) ||
+      block.querySelector(SOURCE_BLOCK_SKIP_SELECTOR)
+    ) || isRawLatexSourceContext(block);
+  }
+
   function renderSourceBlock(block) {
+    if (shouldSkipSourceBlock(block)) {
+      restoreSourceBlock(block);
+      return;
+    }
+
     const sourceFormula = findSourceFormula(block);
     if (!sourceFormula) {
       restoreSourceBlock(block);
@@ -429,14 +541,18 @@
 
     for (const match of matches) {
       if (cursor < match.start) {
-        fragment.append(doc.createTextNode(source.slice(cursor, match.start)));
+        fragment.append(markTransientlyOwned(
+          doc.createTextNode(source.slice(cursor, match.start))
+        ));
       }
       fragment.append(createFormula(doc, match, false));
       cursor = match.end;
     }
 
     if (cursor < source.length) {
-      fragment.append(doc.createTextNode(source.slice(cursor)));
+      fragment.append(markTransientlyOwned(
+        doc.createTextNode(source.slice(cursor))
+      ));
     }
 
     textNode.replaceWith(fragment);
@@ -470,12 +586,48 @@
     return null;
   }
 
-  function isLeafBlock(element) {
-    if (!BLOCK_TAGS.has(element.tagName) || element.closest(IGNORE_SELECTOR)) {
+  function isFormulaBlock(element) {
+    if (
+      !BLOCK_TAGS.has(element.tagName) ||
+      element.closest(IGNORE_SELECTOR) ||
+      isRawLatexSourceContext(element)
+    ) {
       return false;
     }
 
-    return ![...element.children].some((child) => BLOCK_TAGS.has(child.tagName));
+    return true;
+  }
+
+  function closestFormulaBlock(element) {
+    for (
+      let current = element;
+      current && current.nodeType === 1;
+      current = current.parentElement
+    ) {
+      if (isFormulaBlock(current)) return current;
+    }
+    return null;
+  }
+
+  function collectCrossNodeBlocks(element) {
+    const blocks = [];
+    const message = element?.closest?.(ASSISTANT_MESSAGE_SELECTOR) || null;
+
+    for (
+      let current = element;
+      current && current.nodeType === 1;
+      current = current.parentElement
+    ) {
+      if (isFormulaBlock(current)) {
+        blocks.push(current);
+        if (blocks.length >= MAX_CROSS_NODE_BLOCK_ANCESTORS) break;
+      }
+
+      // Do not let a split delimiter combine text from separate messages.
+      if (current === message) break;
+    }
+
+    return blocks;
   }
 
   function renderCrossNodeMath(block) {
@@ -509,26 +661,24 @@
     }
   }
 
-  function scanCrossNodeBlocks(root) {
-    if (!root || root.nodeType === 3) return;
+  function collectCandidateTextNodes(root) {
+    if (!root || isOwnedNode(root)) return [];
 
-    const blocks = [];
-    if (root.nodeType === 1 && isLeafBlock(root)) blocks.push(root);
-    if (root.querySelectorAll) {
-      root.querySelectorAll(BLOCK_SELECTOR).forEach((element) => {
-        if (isLeafBlock(element)) blocks.push(element);
-      });
-    }
-
-    blocks.forEach(renderCrossNodeMath);
-  }
-
-  function scanSingleTextNodes(root) {
-    if (!root) return;
+    const candidates = [];
+    const addCandidate = (node) => {
+      if (
+        node?.isConnected &&
+        !isOwnedNode(node) &&
+        !shouldIgnore(node) &&
+        /[$\\]/.test(node.nodeValue)
+      ) {
+        candidates.push(node);
+      }
+    };
 
     if (root.nodeType === 3) {
-      renderTextNode(root);
-      return;
+      addCandidate(root);
+      return candidates;
     }
 
     const doc = root.ownerDocument || root;
@@ -538,31 +688,76 @@
     try {
       walker = doc.createTreeWalker(root, nodeFilter.SHOW_TEXT, {
         acceptNode(node) {
-          if (shouldIgnore(node)) return nodeFilter.FILTER_REJECT;
-          return /[$\\]/.test(node.nodeValue)
-            ? nodeFilter.FILTER_ACCEPT
-            : nodeFilter.FILTER_REJECT;
+          return isOwnedNode(node) || shouldIgnore(node) || !/[$\\]/.test(node.nodeValue)
+            ? nodeFilter.FILTER_REJECT
+            : nodeFilter.FILTER_ACCEPT;
         }
       });
     } catch (_) {
-      return;
+      return candidates;
     }
 
-    const nodes = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode);
-    nodes.forEach(renderTextNode);
+    while (walker.nextNode()) candidates.push(walker.currentNode);
+    return candidates;
   }
 
   function scan(root) {
-    if (!katexApi) return;
-    scanSourceFormulaBlocks(root);
-    scanCrossNodeBlocks(root);
-    scanSingleTextNodes(root);
+    if (!katexApi || !root || isOwnedNode(root)) return;
+
+    if (ENABLE_REACT_SOURCE_RECOVERY) scanSourceFormulaBlocks(root);
+
+    // Only inspect blocks adjacent to a potential delimiter. The previous
+    // implementation queried every div/p/li in the document after each DOM
+    // mutation, which becomes prohibitively expensive on long conversations.
+    const candidates = collectCandidateTextNodes(root);
+    const wasDeferred = root.nodeType !== 3 && readyLazyTargets.has(root);
+    if (wasDeferred) readyLazyTargets.delete(root);
+
+    if (
+      candidates.length > EAGER_RENDER_CANDIDATE_LIMIT &&
+      !wasDeferred &&
+      deferCandidates(candidates)
+    ) {
+      return;
+    }
+
+    const renderCandidates = wasDeferred &&
+      candidates.length > DEFERRED_RENDER_BATCH_SIZE
+      ? candidates.slice(0, DEFERRED_RENDER_BATCH_SIZE)
+      : candidates;
+    const blocks = new Set();
+
+    renderCandidates.forEach((node) => {
+      collectCrossNodeBlocks(node.parentElement).forEach((block) => {
+        blocks.add(block);
+      });
+    });
+    blocks.forEach(renderCrossNodeMath);
+
+    renderCandidates.forEach((node) => {
+      if (node.isConnected && !isOwnedNode(node)) renderTextNode(node);
+    });
+
+    if (wasDeferred && renderCandidates.length < candidates.length) {
+      readyLazyTargets.add(root);
+      schedule(root);
+    }
   }
 
   function closestFormula(node) {
-    const element = node?.nodeType === 1 ? node : node?.parentElement;
-    return element?.closest?.("[data-paseo-latex]") || null;
+    for (
+      let current = node?.nodeType === 1 ? node : node?.parentNode;
+      current;
+      current = current.parentNode
+    ) {
+      if (
+        current.nodeType === 1 &&
+        current.hasAttribute("data-paseo-latex")
+      ) {
+        return current;
+      }
+    }
+    return null;
   }
 
   function fragmentToText(fragment) {
@@ -607,10 +802,14 @@
     return output.replace(/\n{3,}/g, "\n\n").trim();
   }
 
-  function rewriteCopy(event, ownerDocument) {
+  function rewriteCopy(event, ownerRoot) {
     if (!event.clipboardData) return;
 
-    const selection = ownerDocument.getSelection();
+    const ownerDocument = ownerRoot.ownerDocument || ownerRoot;
+    const rootSelection = ownerRoot.getSelection?.();
+    const selection = rootSelection?.rangeCount
+      ? rootSelection
+      : ownerDocument.getSelection?.();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
 
     const range = selection.getRangeAt(0).cloneRange();
@@ -627,33 +826,124 @@
     if (!plainText) return;
 
     event.clipboardData.setData("text/plain", plainText);
+    // Paseo also listens for copy events. Keep its later handler from
+    // replacing the source LaTeX with the visual MathML representation.
+    event.stopImmediatePropagation();
     event.preventDefault();
   }
 
   const watchedRoots = new WeakSet();
   const watchedDocuments = new WeakSet();
   const watchedFrames = new WeakSet();
-  const rootList = new Set();
-  const queuedNodes = new Set();
-  let flushScheduled = false;
+  const copyBoundRoots = new WeakSet();
+  const queuedRoots = new Set();
+  const SCAN_DEBOUNCE_MS = 50;
+  let flushTimer = null;
 
-  const defer = typeof queueMicrotask === "function"
-    ? queueMicrotask
-    : (callback) => Promise.resolve().then(callback);
+  function normalizedScanRoot(node) {
+    if (!node || isOwnedNode(node)) return null;
+    if (node.nodeType === 3) return node.parentElement;
+
+    return node.nodeType === 1 || node.nodeType === 9 || node.nodeType === 11
+      ? node
+      : null;
+  }
+
+  function containsNode(root, node) {
+    if (root === node) return true;
+    try {
+      return Boolean(root?.contains?.(node));
+    } catch (_) {
+      return false;
+    }
+  }
 
   function schedule(node) {
-    if (!node || (node.nodeType !== 1 && node.nodeType !== 3)) return;
-    queuedNodes.add(node);
+    const root = normalizedScanRoot(node);
+    if (!root) return;
 
-    if (flushScheduled) return;
-    flushScheduled = true;
+    for (const queuedRoot of queuedRoots) {
+      if (containsNode(queuedRoot, root)) return;
+    }
 
-    defer(() => {
-      flushScheduled = false;
-      const nodes = [...queuedNodes];
-      queuedNodes.clear();
-      nodes.forEach(scan);
+    for (const queuedRoot of queuedRoots) {
+      if (containsNode(root, queuedRoot)) queuedRoots.delete(queuedRoot);
+    }
+    queuedRoots.add(root);
+
+    if (flushTimer !== null) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      const roots = [...queuedRoots];
+      queuedRoots.clear();
+      roots.forEach(scan);
+    }, SCAN_DEBOUNCE_MS);
+  }
+
+  function lazyTargetFor(node) {
+    const element = node.parentElement;
+    return element?.closest?.(ASSISTANT_MESSAGE_SELECTOR) ||
+      closestFormulaBlock(element) ||
+      element ||
+      null;
+  }
+
+  function getLazyObserver() {
+    if (lazyObserver || typeof IntersectionObserver !== "function") {
+      return lazyObserver;
+    }
+
+    lazyObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.target.isConnected) {
+          lazyObserver.unobserve(entry.target);
+          lazyObservedTargets.delete(entry.target);
+          state.deferredTargets = Math.max(0, state.deferredTargets - 1);
+          continue;
+        }
+        if (!entry.isIntersecting) continue;
+
+        lazyObserver.unobserve(entry.target);
+        lazyObservedTargets.delete(entry.target);
+        readyLazyTargets.add(entry.target);
+        state.deferredTargets = Math.max(0, state.deferredTargets - 1);
+        schedule(entry.target);
+      }
+    }, { rootMargin: LAZY_RENDER_ROOT_MARGIN });
+
+    return lazyObserver;
+  }
+
+  function deferCandidates(candidates) {
+    // A top-level observer cannot observe nodes from a same-origin iframe.
+    // Render those normally rather than risking a failed or stuck observation.
+    if (candidates.some((node) => node.ownerDocument !== document)) return false;
+
+    const observer = getLazyObserver();
+    if (!observer) return false;
+
+    const targets = new Set();
+    candidates.forEach((node) => {
+      const target = lazyTargetFor(node);
+      if (target?.isConnected) targets.add(target);
     });
+    if (!targets.size) return false;
+
+    for (const target of targets) {
+      if (readyLazyTargets.has(target) || lazyObservedTargets.has(target)) {
+        continue;
+      }
+
+      try {
+        observer.observe(target);
+        lazyObservedTargets.add(target);
+        state.deferredTargets++;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   function inspectElement(element) {
@@ -661,21 +951,28 @@
     if (element.tagName === "IFRAME") watchFrame(element);
   }
 
-  function discover(root) {
-    if (!root) return;
+  function discover(root, includeExistingShadowRoots = false) {
+    if (!root || root.nodeType === 3) return;
     if (root.nodeType === 1) inspectElement(root);
-    if (root.querySelectorAll) root.querySelectorAll("*").forEach(inspectElement);
+    root.querySelectorAll?.("iframe").forEach(watchFrame);
+
+    if (includeExistingShadowRoots) {
+      root.querySelectorAll?.("*").forEach((element) => {
+        if (element.shadowRoot) watchRoot(element.shadowRoot);
+      });
+    }
   }
 
   function onMutations(records) {
     for (const record of records) {
       if (record.type === "characterData") {
-        schedule(record.target);
+        if (!isOwnedNode(record.target)) schedule(record.target);
         continue;
       }
 
       record.addedNodes.forEach((node) => {
-        if (node.nodeType === 1) discover(node);
+        if (isOwnedNode(node)) return;
+        if (node.nodeType === 1) discover(node, false);
         schedule(node);
       });
     }
@@ -683,12 +980,18 @@
 
   const observer = new MutationObserver(onMutations);
 
+  function watchCopy(root) {
+    if (!root || copyBoundRoots.has(root)) return;
+    copyBoundRoots.add(root);
+    root.addEventListener?.("copy", (event) => rewriteCopy(event, root), true);
+  }
+
   function watchRoot(root) {
     if (!root || watchedRoots.has(root)) return;
 
     watchedRoots.add(root);
-    rootList.add(root);
     state.roots++;
+    watchCopy(root);
 
     try {
       observer.observe(root, {
@@ -700,15 +1003,15 @@
       return;
     }
 
-    scan(root);
-    discover(root);
+    discover(root, true);
+    schedule(root);
   }
 
   function watchDocument(doc) {
     if (!doc || watchedDocuments.has(doc)) return;
 
     watchedDocuments.add(doc);
-    doc.addEventListener("copy", (event) => rewriteCopy(event, doc), true);
+    watchCopy(doc);
     watchRoot(doc);
   }
 
@@ -728,11 +1031,30 @@
     inspectFrame();
   }
 
-  function rescanAll() {
-    rootList.forEach((root) => {
-      discover(root);
-      scan(root);
+  function rescanRoot(root, seenRoots) {
+    if (!root || seenRoots.has(root)) return;
+    seenRoots.add(root);
+
+    discover(root, true);
+    schedule(root);
+
+    root.querySelectorAll?.("*").forEach((element) => {
+      if (element.shadowRoot) rescanRoot(element.shadowRoot, seenRoots);
+      if (element.tagName !== "IFRAME") return;
+
+      try {
+        if (element.contentDocument) {
+          watchDocument(element.contentDocument);
+          rescanRoot(element.contentDocument, seenRoots);
+        }
+      } catch (_) {
+        // Cross-origin frames are outside this document's access boundary.
+      }
     });
+  }
+
+  function rescanAll() {
+    rescanRoot(document, new WeakSet());
   }
 
   try {
@@ -758,6 +1080,4 @@
   }
 
   watchDocument(document);
-  setTimeout(rescanAll, 500);
-  setTimeout(rescanAll, 2000);
 })();
