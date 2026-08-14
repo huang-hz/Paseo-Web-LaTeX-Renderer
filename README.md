@@ -108,9 +108,3 @@ On very long conversations, off-screen formulas may temporarily remain as raw La
 脚本不会上传 Paseo 页面内容，也不需要 API Key。它只会从 jsDelivr 加载 KaTeX 的公开资源。
 
 The script does not upload Paseo page content and does not require an API key. It only loads public KaTeX resources from jsDelivr.
-
-## 许可证 / License
-
-发布前建议添加许可证文件，例如 MIT License，以明确使用、修改和再分发权限。
-
-Add a license file, such as the MIT License, before publishing to clarify permissions for use, modification, and redistribution.
