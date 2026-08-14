@@ -1,88 +1,116 @@
 <div align="center">
 
-# 📐 Paseo Web LaTeX Renderer
+# Paseo Web LaTeX Renderer
 
-**将 Paseo Web 中未渲染的 LaTeX 标记转换为原生 MathML,复制时还原原始 LaTeX 源码**
+**将 Paseo Web 中未渲染的 LaTeX 公式显示为 MathML，并支持复制回原始 LaTeX**
 
-**Render unrendered LaTeX markup in [Paseo Web](https://app.paseo.sh/) as native MathML — copy formulas back as LaTeX source**
+**Render raw LaTeX formulas in Paseo Web as MathML and copy them back as original LaTeX**
 
-[![Version](https://img.shields.io/badge/version-2.2.1-blue)](./paseo-web-latex-renderer.user.js)
+[![Version](https://img.shields.io/badge/version-2.3.4-blue)](./paseo-web-latex-renderer.user.js)
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-required-brightgreen)](https://www.tampermonkey.net/)
 [![KaTeX](https://img.shields.io/badge/KaTeX-0.16.21-orange)](https://katex.org/)
-[![Output](https://img.shields.io/badge/output-native%20MathML-yellowgreen)](./paseo-web-latex-renderer.user.js)
 
 </div>
 
-> [!NOTE]
-> **适用场景:** Paseo 的回答、笔记和工作区页面中直接显示 `$...$`、`$$...$$` 等原始公式标记时。
-> **When to use:** Raw formula delimiters such as `$...$` and `$$...$$` appear in Paseo responses, notes, or workspace pages instead of being rendered.
+> 适用于 Paseo 页面直接显示行内或显示 LaTeX 源码，而没有正常排版为公式的情况。  
+> Use this script when Paseo shows raw LaTeX source instead of rendered formulas.
 
----
-
-## 📑 目录 / Contents
-
-- [✨ 功能特性 / Features](#features)
-- [🚀 安装 / Installation](#installation)
-- [📖 使用方式 / Usage](#usage)
-- [🧭 Tampermonkey 菜单 / Menu](#menu)
-
----
-
-<a id="features"></a>
-## ✨ 功能特性 / Features
+## 功能 / Features
 
 | 中文 | English |
 | --- | --- |
-| 支持 `$...$`、`$$...$$`、`\(...\)`、`\[...\]` 四种常见 LaTeX 定界符 | Supports the common `$...$`, `$$...$$`, `\(...\)`, `\[...\]` LaTeX delimiters |
-| 使用浏览器原生 MathML 输出,避免 Paseo Shadow DOM 缺失 KaTeX CSS 造成的重复或错误排版 | Uses browser-native MathML to avoid duplicate or broken KaTeX HTML output when Paseo's Shadow DOM does not inherit KaTeX CSS |
-| 支持 Paseo 的动态页面更新、开放 Shadow DOM 和同源 iframe | Handles Paseo's dynamic updates, open Shadow DOM, and same-origin iframes |
-| 识别被页面拆分到多个 DOM 文本节点中的公式 | Detects formulas split across multiple DOM text nodes |
-| 针对被 Paseo/Markdown 预处理的独立显示公式,尝试从组件源码恢复原始 LaTeX | Attempts to recover standalone display formulas that Paseo or Markdown has already preprocessed |
-| 复制渲染公式时,恢复原始 `$...$` 或 `$$...$$` 源码 | Copies rendered formulas back as their original `$...$` or `$$...$$` source |
-| 对 `1.56%`、`\ &\` 位运算 AND 等生成式写法做仅渲染层面的兼容处理,复制仍保留原始内容 | Rendering-only compatibility fixes for common generated text, such as `1.56%` and `\ &\` bitwise AND; copied text remains unchanged |
-| 提供诊断与手动重扫菜单项 | Includes diagnostic and manual-rescan menu commands |
+| 支持常见的行内与显示 LaTeX 公式写法 | Supports common inline and display LaTeX delimiters |
+| 自动区分句内公式与独立显示公式 | Automatically distinguishes inline and standalone display formulas |
+| 检测带 \tag 或 \tag* 的公式，并按显示公式处理 | Detects equations using \tag or \tag* and handles them as display math |
+| 处理被 Paseo 拆分到多个文本节点或页面块中的公式 | Handles formulas split across multiple text nodes or page blocks |
+| 支持动态加载内容、开放 Shadow DOM 与同源 iframe | Supports dynamic content, open Shadow DOM, and same-origin iframes |
+| 复制公式或包含公式的文字时，恢复原始 LaTeX 源码 | Restores original LaTeX when copying formulas or surrounding text |
+| 针对长对话优化，优先保持页面流畅 | Optimized for long conversations to keep pages responsive |
+| 提供诊断与手动重新扫描菜单 | Includes diagnostic and manual rescan menu commands |
 
-<a id="installation"></a>
-## 🚀 安装 / Installation
+## 安装 / Installation
 
+1. 安装并启用 [Tampermonkey](https://www.tampermonkey.net/)。
+2. 在 Edge 或 Chrome 扩展设置中，允许 Tampermonkey 访问 Paseo 网站。
+3. 打开 [paseo-web-latex-renderer.user.js](./paseo-web-latex-renderer.user.js)，点击 Raw 后由 Tampermonkey 安装；也可以新建脚本并粘贴全部内容。
+4. 保存后刷新 Paseo 页面。首次安装或升级后，建议按 Ctrl+F5 强制刷新。
 
+1. Install and enable [Tampermonkey](https://www.tampermonkey.net/).
+2. Allow Tampermonkey to access Paseo in your Edge or Chrome extension settings.
+3. Open [paseo-web-latex-renderer.user.js](./paseo-web-latex-renderer.user.js), click Raw, and install it with Tampermonkey. You can also create a new userscript and paste in the full source.
+4. Refresh Paseo after saving. Use Ctrl+F5 after first installation or an update.
 
-| 步骤 | 中文 | English |
-| :--: | --- | --- |
-| **1** | 安装并启用 Tampermonkey | Install and enable Tampermonkey |
-| **2** | 在 Edge 扩展详情中,将 Tampermonkey 的“站点访问权限”设为“在所有网站上”,或至少允许 `https://app.paseo.sh/*` | In the Edge extension details, set Tampermonkey site access to **On all sites**, or at minimum allow `https://app.paseo.sh/*` |
-| **3** | 打开 [paseo-web-latex-renderer.user.js](./paseo-web-latex-renderer.user.js),点击 **Raw** 由 Tampermonkey 安装;也可以新建脚本并粘贴全部内容 | Open [paseo-web-latex-renderer.user.js](./paseo-web-latex-renderer.user.js), click **Raw**, and let Tampermonkey install it; or create a new userscript and paste the entire file |
-| **4** | 保存后刷新 Paseo 页面,首次安装或更新后建议 `Ctrl+F5` 强制刷新 | Refresh the Paseo page; use `Ctrl+F5` after the first installation or an update |
+The script matches:
 
-脚本匹配以下 Paseo 地址,以覆盖内嵌阅读视图 / The userscript matches the following Paseo URLs:
+    https://app.paseo.sh/*
+    https://*.paseo.sh/*
+    https://paseo.sh/*
 
-```text
-https://app.paseo.sh/*
-https://*.paseo.sh/*
-https://paseo.sh/*
-```
+## 使用 / Usage
 
-<a id="usage"></a>
-## 📖 使用方式 / Usage
+打开 Paseo 页面后，原始公式会自动渲染。例如：
 
-页面中的原始公式会被自动渲染,例如 / Raw formulas on the page are rendered automatically:
+    Inline: $v_{ij} = x_i \cdot SF$
 
-```latex
-$$\mathcal{T}[v_{ij}, m_j] \approx \left(\frac{\hat{x}_i - x_i}{x_i}\right)^2$$
+    $$\mathcal{T}[v_{ij}, m_j] \approx \left(\frac{\hat{x}_i - x_i}{x_i}\right)^2$$
 
-Inline math: $v_{ij} = x_i \cdot SF$
-```
+句内的双美元公式会保持在正文行内；单独成行的公式会以显示公式排版。带 \tag{16} 的公式会按编号公式处理。
 
-> [!TIP]
-> **中文:** 选中包含渲染公式的文本并复制,粘贴后的公式会恢复为原始 LaTeX 定界符和源码,而不是视觉字符或 MathML。
->
-> **English:** Select text containing a rendered formula and copy it. The pasted formula is restored as its original LaTeX delimiter and source, rather than visual characters or MathML.
+Raw formulas render automatically after the page opens. Sentence-embedded double-dollar formulas stay inline, while standalone formulas use display layout. Equations with \tag{16} are handled as numbered display equations.
 
-<a id="menu"></a>
-## 🧭 Tampermonkey 菜单 / Tampermonkey Menu
+选中并复制公式或包含公式的文字，粘贴时会得到原始 LaTeX，而不是 MathML 或视觉字符。
+
+Select and copy a formula, or text containing one, to paste the original LaTeX instead of MathML or visual characters.
+
+## 长对话 / Long Conversations
+
+在很长的对话中，远离当前屏幕的原始公式可能会暂时保留为 LaTeX 源码。滚动接近该区域后会继续渲染；也可以使用手动重新扫描。
+
+On very long conversations, off-screen formulas may temporarily remain as raw LaTeX. They render when you scroll near them, or after a manual rescan.
+
+## Tampermonkey 菜单 / Menu
 
 | Command | 中文 | English |
 | --- | --- | --- |
-| `Paseo LaTeX: Diagnose` | 查看 KaTeX 加载状态、监听到的 DOM 根节点数、公式渲染数量和最近错误 | Shows KaTeX status, observed DOM roots, render counts, and the latest error |
-| `Paseo LaTeX: Rescan` | 手动重新扫描当前页面,适用于延迟加载或局部更新后仍有原始公式的情况 | Rescans the current page after delayed loading or partial page updates |
+| Paseo LaTeX: Diagnose | 查看 KaTeX 状态、已渲染公式数量和最近错误 | Shows KaTeX status, rendered formula count, and recent errors |
+| Paseo LaTeX: Rescan | 重新扫描当前页面，用于延迟加载或遗漏的公式 | Rescans the current page for delayed or missed formulas |
 
+## 常见问题 / Troubleshooting
+
+| 现象 | 处理方式 |
+| --- | --- |
+| 页面没有公式渲染 | 检查脚本已启用且 Tampermonkey 有 Paseo 站点权限，然后按 Ctrl+F5 |
+| 仍有少量原始公式 | 滚动到该区域，或运行 Paseo LaTeX: Rescan |
+| 公式显示红色 | 公式可能使用了 KaTeX 不支持的语法；请附上可公开的最小示例提交 Issue |
+| 复制结果不是 LaTeX | 更新到最新版本，选中公式后使用 Ctrl+C 复制 |
+
+| Symptom | Suggested action |
+| --- | --- |
+| No formulas render | Confirm that the script is enabled and has Paseo site access, then press Ctrl+F5 |
+| Some raw formulas remain | Scroll near the formula or run Paseo LaTeX: Rescan |
+| A formula is red | The syntax may not be supported by KaTeX; include a shareable minimal example in an Issue |
+| Copy does not return LaTeX | Update to the latest version, select the formula, and copy with Ctrl+C |
+
+## 兼容性与限制 / Compatibility and Limitations
+
+- 推荐使用最新版 Microsoft Edge 或 Google Chrome。
+- 代码块、输入框和正在编辑的内容不会被处理。
+- 关闭模式的 Shadow DOM、无法访问的跨域 iframe，以及图片或 Canvas 中的公式无法处理。
+- KaTeX 不是完整 TeX 引擎，少数宏或环境可能不受支持。
+
+- Recent Microsoft Edge and Google Chrome are recommended.
+- Code blocks, inputs, and editable content are intentionally skipped.
+- Closed Shadow DOM, inaccessible cross-origin iframes, and formulas rendered as images or Canvas cannot be processed.
+- KaTeX is not a complete TeX engine; some macros or environments may not be supported.
+
+## 隐私 / Privacy
+
+脚本不会上传 Paseo 页面内容，也不需要 API Key。它只会从 jsDelivr 加载 KaTeX 的公开资源。
+
+The script does not upload Paseo page content and does not require an API key. It only loads public KaTeX resources from jsDelivr.
+
+## 许可证 / License
+
+发布前建议添加许可证文件，例如 MIT License，以明确使用、修改和再分发权限。
+
+Add a license file, such as the MIT License, before publishing to clarify permissions for use, modification, and redistribution.
